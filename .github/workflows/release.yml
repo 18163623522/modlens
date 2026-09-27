@@ -3,6 +3,8 @@ name: release
 # Publishes to npm and creates the GitHub Release when a v* tag is pushed. The
 # tag is normally created by scripts/release.mjs (`pnpm release <version>`),
 # which runs the same guards locally and pushes the tag but does NOT publish.
+# It pushes main only after this run succeeds and npm has the version, so a
+# failed release never leaves main pinning a version npm does not have.
 # This workflow is the single place that publishes, so the two can never race.
 # It re-runs the guards in CI, publishes with provenance, then cuts the Release
 # with the matching CHANGELOG section as its notes.

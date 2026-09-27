@@ -13,6 +13,12 @@
 // which is the single place that runs `npm publish` and creates the GitHub
 // Release. Publishing from both here and CI is a race that double-publishes or
 // fails half-way, so the tag push is the one handoff.
+//
+// main is pushed last, once npm answers with the new version. main is what
+// users install from (INSTALL.md clones it, and its launchers pin this
+// version), so a main pushed with the tag pins a version npm does not have
+// until the run finishes, and for good if the run fails. Pushing the tag alone
+// keeps a failed release from touching anything users install.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -69,11 +75,10 @@ if (run('git', ['tag', '--list', `v${next}`])) {
     fail(`tag v${next} already exists.`);
 }
 
-// The push at the end must be all-or-nothing, and it can only be that if the
-// branch update is a fast-forward. Git happily accepts a tag while rejecting a
-// stale main in the same push, and that half-success triggers the release
-// workflow on a tree origin/main does not contain. So: sync with the remote
-// now, refuse a stale or diverged main, refuse a tag the remote already has.
+// The tag goes out before main, so main must be able to fast-forward onto the
+// tagged tree when its turn comes: otherwise the release would publish a tree
+// origin/main never contains. So: sync with the remote now, refuse a stale or
+// diverged main, refuse a tag the remote already has.
 run('git', ['fetch', 'origin', 'main']);
 try {
     run('git', ['merge-base', '--is-ancestor', 'origin/main', 'HEAD']);
@@ -121,12 +126,60 @@ writeFileSync(pkgPath, pkgRaw.replace(`"version": "${pkg.version}"`, `"version":
 stampLaunchers(root);
 run('git', ['commit', '-am', `chore(release): v${next}`]);
 run('git', ['tag', '-a', `v${next}`, '-m', `v${next}`]);
-// --atomic: the branch and the tag land together or not at all. The old
-// --follow-tags push could deliver the tag while main was rejected as
-// non-fast-forward, releasing a tree the remote branch never contained.
-run('git', ['push', '--atomic', 'origin', 'main', `refs/tags/v${next}`]);
-
+run('git', ['push', 'origin', `refs/tags/v${next}`]);
 console.log(
-    `\nTag v${next} pushed. CI will finish the release: npm publish and the GitHub Release.`,
+    `\nTag v${next} pushed. Waiting for the release workflow (npm publish, GitHub Release).`,
 );
-console.log('Watch it: gh run watch, or https://github.com/liustack/modlens/actions');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let runId = '';
+for (let i = 0; i < 30 && !runId; i++) {
+    runId = run('gh', [
+        'run',
+        'list',
+        '--workflow',
+        'release.yml',
+        '--branch',
+        `v${next}`,
+        '--limit',
+        '1',
+        '--json',
+        'databaseId',
+        '--jq',
+        '.[0].databaseId // empty',
+    ]);
+    if (!runId) await sleep(5000);
+}
+if (!runId) {
+    fail(`no release.yml run appeared for v${next}. main was not pushed. Check the Actions tab.`);
+}
+try {
+    runLoud('gh', ['run', 'watch', runId, '--exit-status']);
+} catch {
+    fail(
+        `the release workflow failed (run ${runId}). main was not pushed, so installs are unaffected.\n` +
+            `Fix the cause, then re-run that workflow for v${next}, or retract the tag and start over:\n` +
+            `  git push origin :refs/tags/v${next} && git tag -d v${next} && git reset --hard HEAD~1`,
+    );
+}
+
+let live = false;
+for (let i = 0; i < 24 && !live; i++) {
+    try {
+        live = run('npm', ['view', `${pkg.name}@${next}`, 'version']) === next;
+    } catch {
+        // Not visible yet: the registry takes a moment after the upload.
+    }
+    if (!live) await sleep(5000);
+}
+if (!live) {
+    fail(
+        `the workflow passed but npm does not answer ${pkg.name}@${next} yet. Push main once it does: git push origin main`,
+    );
+}
+
+// npm has it, so main may now pin it.
+run('git', ['push', 'origin', 'main']);
+console.log(`\n${pkg.name}@${next} is on npm and main is pushed.`);
+console.log(`https://github.com/liustack/modlens/releases/tag/v${next}`);
