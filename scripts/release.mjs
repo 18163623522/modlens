@@ -164,10 +164,13 @@ try {
     );
 }
 
+// npm serves package metadata through a CDN with max-age=300, so a version
+// published a moment ago can stay invisible for up to five minutes. Poll for
+// seven, with --prefer-online so the local npm cache adds nothing on top.
 let live = false;
-for (let i = 0; i < 24 && !live; i++) {
+for (let i = 0; i < 84 && !live; i++) {
     try {
-        live = run('npm', ['view', `${pkg.name}@${next}`, 'version']) === next;
+        live = run('npm', ['view', `${pkg.name}@${next}`, 'version', '--prefer-online']) === next;
     } catch {
         // Not visible yet: the registry takes a moment after the upload.
     }
