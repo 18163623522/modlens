@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.26.6 - 2026-10-04
+
+- **dsh: a route still starting up at boot gets wrapped once it is ready ([#116](https://github.com/liustack/modlens/issues/116)).** Auto-discovery only swept on `llm/adapters-updated`. An account route registers once per boot, and if the sweep probed it while it was still initializing (`listModels` threw or listed nothing yet), the plugin let go of it and waited for the next topology change. On a quiet machine that change never came, so the `modlens-*` wrapper stayed missing until something unrelated touched the registry. A sweep that leaves a route unresolved now runs again after 5 seconds, 30 seconds and 2 minutes. A topology event starts that round over, and unloading the plugin cancels a pending retry. A route that simply has nothing to wrap costs three extra probes, not endless polling. Thanks to @Ztyss for instrumenting a live host down to the exact branch that lost the wakeup.
+
 ## 3.26.5 - 2026-09-24
 
 - **dsh: the config card retries a failed load in place.** On the dsh 0.1.7 Plugins page the form opens without a header, so collapse and expand, which used to retry a failed load, no longer exists there. A failed load (a malformed `~/.modlens/config.json`, say) now shows a Retry control beside the error, in the Settings card too. The control stays flush left when a long error wraps it onto its own line.
