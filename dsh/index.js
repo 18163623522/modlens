@@ -610,7 +610,9 @@ function registerPasteRoute(ctx, host, ownProviders, config = {}) {
  *   zai, ...) wraps them all instead of hand-picking one. A `discover` array
  *   of provider ids narrows the set. Routes that register late (llm-pi-ai
  *   mounts its routes after settings load) are picked up by re-sweeping on
- *   the registry's own `llm/adapters-updated` notification, no polling. The
+ *   the registry's own `llm/adapters-updated` notification. A route that
+ *   registered but could not answer yet gets a few bounded retries on top
+ *   (issue #116), never open-ended polling. The
  *   deepseek-official wrap keeps its historical `deepseek-modlens` id, so a
  *   selector remembering that provider survives the upgrade.
  */
@@ -720,8 +722,13 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
   // framework tears down independently.
   let active = true
   const claimedProviders = new Set()
+  // A pending discovery retry (see scheduleRetry). Plain JavaScript work like
+  // the promises above, so the disposer cancels it rather than Cordis.
+  let retryTimer
   const deactivate = () => {
     active = false
+    clearTimeout(retryTimer)
+    retryTimer = undefined
     for (const providerId of claimedProviders) ownProviders?.delete(providerId)
     claimedProviders.clear()
   }
@@ -1049,17 +1056,44 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
   // skip it while this one is still probing), and sweeps are serialized on
   // one promise chain so two can never interleave their probes at all.
   const discover = Array.isArray(config.discover) ? new Set(config.discover) : null
+  // The registry's notification fires when a route registers, not when it
+  // can answer. An account route registers once per boot and may still be
+  // initializing when the sweep probes it (issue #116): listModels throws or
+  // lists nothing, the claim is released, and on a quiet machine no later
+  // notification ever arrives, so the wrapper stays missing until something
+  // unrelated moves the topology. A sweep that leaves a route unresolved
+  // therefore re-runs itself on a short backoff, bounded so a route that is
+  // simply not wrappable costs three extra probes, not a poll forever. A
+  // topology notification starts the round over, because the route it
+  // announces may itself still be settling.
+  const RETRY_DELAYS_MS = [5_000, 30_000, 120_000]
+  let retryStep = 0
+  const scheduleRetry = () => {
+    if (!active || retryTimer !== undefined || retryStep >= RETRY_DELAYS_MS.length) return
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      retryStep += 1
+      void sweep()
+    }, RETRY_DELAYS_MS[retryStep])
+    // A retry is never a reason to keep the host process alive.
+    retryTimer.unref?.()
+  }
   const sweepOnce = async () => {
     if (!activationCanCommit()) return
+    let unresolved
     try {
-      await sweepBody()
+      unresolved = await sweepBody()
     } catch (error) {
       if (!active) return
       // A sweep failure must never become an unhandled rejection inside the
-      // host process; the next topology notification simply tries again.
+      // host process; the retry or the next topology notification tries again.
       console.error(`[modlens] vision provider discovery sweep failed: ${error}`)
+      unresolved = true
     }
+    if (unresolved) scheduleRetry()
   }
+  // Resolves true when some route was released unresolved and is worth
+  // probing again without waiting for the registry.
   const sweepBody = async () => {
     if (!active) return
     if (typeof llm.listProviders !== 'function') {
@@ -1075,6 +1109,7 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
     // Same tolerance as the pinned path: an entry may be a bare id string.
     const idOf = (info) => (typeof info === 'string' ? info : info?.id)
     const available = new Set(providers.map(idOf).filter(Boolean))
+    let unresolved = false
     for (const [upstream, current] of registrations) {
       if (!active) return
       if (available.has(upstream)) continue
@@ -1099,9 +1134,10 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
         models = await llm.listModels(id)
       } catch {
         if (!activationCanCommit()) return
-        // Unreachable route today; release the claim so a later topology
-        // change retries it.
+        // Unreachable route today, or one still initializing; release the
+        // claim so a retry or a later topology change probes it again.
         wrapped.delete(id)
+        unresolved = true
         continue
       }
       // The promise can settle just before Cordis marks this fiber UNLOADING,
@@ -1112,13 +1148,16 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
       if (!models.some(shouldWrap)) {
         // No eligible models yet: release, the route may gain some later.
         wrapped.delete(id)
+        unresolved = true
         continue
       }
       const providerId = id === 'deepseek-official' ? 'deepseek-modlens' : `modlens-${id}`
       if (!registerWrapper(id, providerId, `${base} (modlens vision)`)) {
         wrapped.delete(id)
+        unresolved = true
       }
     }
+    return unresolved
   }
   // Serialize: a sweep triggered mid-sweep runs after, never interleaved.
   // The first sweep is invoked directly so its synchronous prefix (the
@@ -1130,6 +1169,9 @@ function registerVisionProvider(ctx, config, ownProviders, evidenceCache) {
   }
   if (typeof ctx.on === 'function') {
     ctx.on('llm/adapters-updated', () => {
+      clearTimeout(retryTimer)
+      retryTimer = undefined
+      retryStep = 0
       void sweep()
     })
   }

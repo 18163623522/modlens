@@ -3412,6 +3412,119 @@ describe('dsh vision provider auto-discovery (#29)', () => {
         expect(registered).toEqual(['modlens-opencode-go']);
     });
 
+    describe('a probe that misses at boot is retried on a quiet host (#116)', () => {
+        // The account route registers once per boot and nothing else moves
+        // the topology afterwards, so this fake registry never broadcasts
+        // llm/adapters-updated on its own: any recovery has to come from the
+        // plugin itself.
+        async function quietHost(
+            listModels: () => Promise<Array<{ id: string; inputModalities?: string[] }>>,
+        ) {
+            // @ts-expect-error untyped on purpose
+            const plugin = (await import('../dsh/index.js')) as {
+                apply: (ctx: unknown, config?: Record<string, unknown>) => void;
+            };
+            const registered: string[] = [];
+            const handlers: Record<string, () => void> = {};
+            let calls = 0;
+            let dispose: (() => void) | undefined;
+            const ctx = {
+                tools: { register: () => {} },
+                attachments: {},
+                on: (event: string, fn: () => void) => {
+                    handlers[event] = fn;
+                },
+                inject: (deps: string[], fn: (scope: unknown) => (() => void) | undefined) => {
+                    if (deps.includes('llm')) dispose = fn(ctx);
+                },
+                llm: {
+                    registerAdapter: (ids: string[]) => {
+                        registered.push(ids[0]);
+                    },
+                    listProviders: () => [{ id: 'deepseek-account', name: 'DeepSeek Account' }],
+                    listModels: () => {
+                        calls += 1;
+                        return listModels();
+                    },
+                    resolveModelInfo: async () => ({}),
+                    stream: () => (async function* () {})(),
+                },
+            };
+            plugin.apply(ctx as never, {});
+            await vi.advanceTimersByTimeAsync(10);
+            return { registered, handlers, calls: () => calls, dispose: () => dispose?.() };
+        }
+
+        const withFakeTimers = (body: () => Promise<void>) => async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+            try {
+                await body();
+            } finally {
+                vi.useRealTimers();
+            }
+        };
+
+        it(
+            'a route whose probe threw while it initialized is wrapped once it settles',
+            withFakeTimers(async () => {
+                let ready = false;
+                const host = await quietHost(async () => {
+                    if (!ready) throw new Error('route still initializing');
+                    return [{ id: 'deepseek-v4-pro', inputModalities: ['text'] }];
+                });
+                expect(host.registered).toEqual([]);
+                ready = true;
+                await vi.advanceTimersByTimeAsync(5_000);
+                expect(host.registered).toEqual(['modlens-deepseek-account']);
+            }),
+        );
+
+        it(
+            'a route that listed no models yet is wrapped once its models load',
+            withFakeTimers(async () => {
+                const models: Array<{ id: string; inputModalities?: string[] }> = [];
+                const host = await quietHost(async () => models);
+                expect(host.registered).toEqual([]);
+                models.push({ id: 'deepseek-v4-pro', inputModalities: ['text'] });
+                await vi.advanceTimersByTimeAsync(5_000);
+                expect(host.registered).toEqual(['modlens-deepseek-account']);
+            }),
+        );
+
+        it(
+            'retries are bounded, and a topology change starts a fresh round',
+            withFakeTimers(async () => {
+                const host = await quietHost(async () => [
+                    { id: 'deepseek-flash', inputModalities: ['text', 'image'] },
+                ]);
+                expect(host.calls()).toBe(1);
+                await vi.advanceTimersByTimeAsync(60 * 60_000);
+                // The boot probe plus three retries, then the plugin goes back
+                // to waiting for the registry.
+                expect(host.calls()).toBe(4);
+                host.handlers['llm/adapters-updated']();
+                await vi.advanceTimersByTimeAsync(60 * 60_000);
+                expect(host.calls()).toBe(8);
+                expect(host.registered).toEqual([]);
+            }),
+        );
+
+        it(
+            'a pending retry dies with the activation',
+            withFakeTimers(async () => {
+                const host = await quietHost(async () => {
+                    throw new Error('route still initializing');
+                });
+                expect(vi.getTimerCount()).toBe(1);
+                host.dispose();
+                // Cancelled, not merely ignored when it fires.
+                expect(vi.getTimerCount()).toBe(0);
+                await vi.advanceTimersByTimeAsync(60 * 60_000);
+                expect(host.calls()).toBe(1);
+            }),
+        );
+    });
+
     it('the legacy fallback on an old registry surface registers exactly once', async () => {
         // @ts-expect-error untyped on purpose
         const plugin = (await import('../dsh/index.js')) as {
